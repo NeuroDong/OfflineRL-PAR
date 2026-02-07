@@ -26,6 +26,7 @@ import traceback
 
 import d4rl
 from utils import utils
+from utils.utils import ConfigStateManager
 from utils.data_sampler import Data_Sampler, ReplayBufferDataset
 # from utils.logger import logger, setup_logger
 from torch.utils.data import DataLoader
@@ -33,7 +34,7 @@ from itertools import cycle
 
 import wandb
 # os.environ['WANDB_BASE_URL'] = 'https://api.bandw.top'
-os.environ['WANDB_MODE'] = 'online' # 'online' or 'offline' or 'dryrun'
+os.environ['WANDB_MODE'] = 'offline' # 'online' or 'offline' or 'dryrun'
 import random
 import threading
 import copy
@@ -42,6 +43,9 @@ from queue import Queue
 from collections import deque
 
 from gym.vector import AsyncVectorEnv
+import itertools
+import multiprocessing as mp
+from gym.vector import AsyncVectorEnv, SyncVectorEnv
 
 
 
@@ -138,6 +142,7 @@ def train_agent(env, state_dim, action_dim, max_action, device, args):
     dataloader = DataLoader(replaybufferDataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=True, drop_last=True)
     dataloader_iter = cycle(dataloader)
 
+    
     if args.algo == 'TD3+BC':
         from agents.TD3_BC import TD3_BC as Agent
         agent = Agent(state_dim, action_dim, max_action, device, args, discount=args.discount, tau=args.tau, policy_noise=args.policy_noise, noise_clip=args.noise_clip, policy_freq=args.policy_freq, alpha=args.alpha)
@@ -239,7 +244,7 @@ def eval_fun(agent, loss_metric, training_iters, args, curr_epoch, eval_lock, ev
 # ...existing code...
 def eval_policy_Parallel(policy, env_name, seed, eval_episodes=100, num_envs=10):
     """
-    并行评估 agent 的性能，使用 gym.vector.AsyncVectorEnv 加速。
+    并行评估 agent 的性能，优先使用 AsyncVectorEnv；如果当前进程为 daemon 或创建失败则回退为 SyncVectorEnv。
     """
     assert eval_episodes % num_envs == 0, "eval_episodes 必须能被 num_envs 整除"
 
@@ -250,9 +255,7 @@ def eval_policy_Parallel(policy, env_name, seed, eval_episodes=100, num_envs=10)
             return env
         return _init
 
-    # 创建并行环境
-    # 修改: 使用 AsyncVectorEnv 替代 SyncVectorEnv 以利用多进程并行
-    eval_env = AsyncVectorEnv([make_env_fn(i) for i in range(num_envs)])
+    eval_env = SyncVectorEnv([make_env_fn(i) for i in range(num_envs)])
 
     scores = []
     episodes_per_env = eval_episodes // num_envs
@@ -283,13 +286,26 @@ def eval_policy_Parallel(policy, env_name, seed, eval_episodes=100, num_envs=10)
     return avg_reward, std_reward, avg_norm_score, std_norm_score
 
 
-def sweep_train(base_args, env_name, state_dim, action_dim, max_action, device):
+def sweep_train(base_args, env_name, state_dim, action_dim, max_action, device, config_dict=None):
     dir_name = f"wandb_task/{base_args.env_name}_{base_args.algo}_{base_args.usesynthetic_data}"
-    with wandb.init(dir=dir_name, mode="online") as run:
+    
+    init_kwargs = {
+        "dir": dir_name,
+        "mode": "offline",
+        "config": config_dict,
+        # 使用传入的 wandb 项目与实体（已在 run() 中写入 base_args）
+        "project": getattr(base_args, "wandb_project", None),
+        "entity": getattr(base_args, "wandb_entity", None),
+    }
+    
+    if hasattr(base_args, 'sweep_id') and base_args.sweep_id:
+        os.environ['WANDB_SWEEP_ID'] = base_args.sweep_id
+
+    with wandb.init(**init_kwargs) as run:
         config = wandb.config
 
         local_args = copy.deepcopy(base_args)
-        name = f"{local_args.env_name}"
+        name = f"{local_args.algo}-{local_args.env_name}"
         if hasattr(config, 'start_synthetic_epoch'):
             local_args.start_synthetic_epoch = config.start_synthetic_epoch
             name += f"-startSynthetic{local_args.start_synthetic_epoch}"
@@ -317,19 +333,36 @@ def sweep_train(base_args, env_name, state_dim, action_dim, max_action, device):
         np.random.seed(local_args.seed)
         train_agent(env, state_dim, action_dim, max_action, device, local_args)
 
-def run_agent(sweep_id, base_args, env_name, state_dim, action_dim, max_action, device, entity=None, project=None):
-    def sweep_entry():
-        sweep_train(base_args, env_name, state_dim, action_dim, max_action, device)
-    wandb.agent(sweep_id, function=sweep_entry, entity=entity, project=project)
-
+def run_offline_worker(config_dict, base_args, env_name, state_dim, action_dim, max_action, device, state_file):
+    """
+    Wrapper function for multiprocessing with distributed state management
+    注意：每个worker进程创建自己的state_manager实例，因为它们都操作同一个文件
+    """
+    # 每个worker进程创建自己的state_manager实例
+    state_manager = ConfigStateManager(state_file)
+    
+    # 尝试声明这个配置
+    if not state_manager.try_claim_config(config_dict):
+        logging.info(f"Config already claimed by another process, skipping: {config_dict}")
+        return
+    
+    try:
+        logging.info(f"Starting training for config: {config_dict}")
+        sweep_train(base_args, env_name, state_dim, action_dim, max_action, device, config_dict)
+        state_manager.mark_config_completed(config_dict)
+        logging.info(f"Completed training for config: {config_dict}")
+    except Exception as e:
+        error_msg = f"{type(e).__name__}: {str(e)}"
+        logging.error(f"Failed training for config {config_dict}: {error_msg}")
+        logging.error(traceback.format_exc())
+        state_manager.mark_config_failed(config_dict, error_msg)
+        raise
 
 if __name__ == "__main__":
-    # Search_hyperparameters = True
-    # sweep_id = None
-    # wandb_entity = "dongjinzong"
-    # wandb_project = "Proximal-Generation-Action"
-
+    import multiprocessing
+    multiprocessing.set_start_method('spawn', force=True)
     logging.info("Start...")
+
     parser = argparse.ArgumentParser()
     
     # wandb Setups
@@ -377,6 +410,7 @@ if __name__ == "__main__":
     parser.add_argument("--synthetic_percent_range", default=(0., 0.5), type=tuple)   # [P_{min}, P_{max}] in the paper
     parser.add_argument("--LossMultiplier", default=1.5, type=float)    # \beta in the paper
     parser.add_argument("--Just_topK", default=False, type=float)    # just use topK samples without generate synthetic data
+    
 
     args = parser.parse_args()
     args.device = f"cuda:{args.device}" if torch.cuda.is_available() else "cpu"
@@ -384,7 +418,6 @@ if __name__ == "__main__":
 
     args.batch_size = args.batch_size * args.multiply_batch_size
     args.num_steps_per_epoch = args.num_steps_per_epoch // args.multiply_batch_size
-
 
     if args.algo == 'TD3+BC':
         args.eval_freq = hyperparameters_TD3_BC[args.env_name]['eval_freq']
@@ -421,8 +454,16 @@ if __name__ == "__main__":
 
     logging.info(f"args: {args}")
 
+    # Setup Logging
+    file_name = f"{args.env_name}|{args.exp}|diffusion-{args.algo}|T-{args.T}"
+    if args.lr_decay: file_name += '|lr_decay'
+    file_name += f'|ms-{args.ms}'
+
+    if args.ms == 'offline': file_name += f'|k-{args.top_k}'
+    file_name += f'|{args.seed}'
+
     variant = vars(args)
-    variant.update(version=f"PAR")
+    variant.update(version=f"Diffusion-Policies-RL")
 
     env = gym.make(args.env_name)
     env.seed(args.seed)
@@ -438,37 +479,63 @@ if __name__ == "__main__":
     variant.update(state_dim=state_dim)
     variant.update(action_dim=action_dim)
     variant.update(max_action=max_action)
+    # setup_logger(os.path.basename(results_dir), variant=variant, log_dir=results_dir)
     utils.print_banner(f"Env: {args.env_name}, state_dim: {state_dim}, action_dim: {action_dim}")
 
-
+    import itertools
+    
     # Calculate the mean and standard deviation after five random runs.
-    sweep_config = {
-    'name': f'{args.algo} in {args.env_name} {"with" if args.usesynthetic_data else "without"} synthetic',
-    'method': 'grid',  # 可选：'grid', 'random', 'bayes'
-    'metric': {
-        'name': 'Best Average Episodic N-Reward',
-        'goal': 'maximize'
-    },
-    'parameters': {
-        "run_idx": {'values': [0, 1, 2, 3, 4]}
+    sweep_parameters = {
+        "run_idx": [0, 1, 2, 3, 4]
     }
-    }
-
-    if args.sweep_id is None:
-        args.sweep_id = wandb.sweep(sweep_config, project=args.wandb_project)
-
-    import multiprocessing
-    multiprocessing.set_start_method('spawn', force=True)
-    num_agents = min(40, max(1, multiprocessing.cpu_count() // 2))  # 根据机器调整并行数
-    logging.info(f"Starting {num_agents} parallel agents for hyperparameter sweep.")
-    procs = []
-    for i in range(num_agents):
-        p = multiprocessing.Process(
-            target=run_agent,
-            args=(args.sweep_id, args, args.env_name, state_dim, action_dim, max_action, args.device, args.wandb_entity, args.wandb_project)
-        )
-        p.start()
-        procs.append(p)
-
-    for p in procs:
-        p.join()
+    
+    # Generate all combinations
+    keys = sweep_parameters.keys()
+    values = sweep_parameters.values()
+    combinations = list(itertools.product(*values))
+    all_configs = [dict(zip(keys, c)) for c in combinations]
+    
+    num_all_configs = len(all_configs)
+    logging.info(f"Generated {num_all_configs} hyperparameter combinations for offline sweep.")
+    
+    # 初始化分布式状态管理器
+    state_file = os.path.join(args.output_dir, f'.sweep_state_{args.env_name}_{args.algo}.json')
+    os.makedirs(args.output_dir, exist_ok=True)
+    state_manager = ConfigStateManager(state_file)
+    
+    # 获取待处理的配置（跳过已完成和正在运行的）
+    pending_configs = state_manager.get_pending_configs(all_configs)
+    num_pending = len(pending_configs)
+    
+    # 显示状态摘要
+    summary = state_manager.get_status_summary()
+    logging.info(f"Search status: {summary}")
+    logging.info(f"Pending configs: {num_pending}/{num_all_configs}")
+    
+    if num_pending == 0:
+        logging.info("All configurations have been processed. Exiting.")
+    else:
+        # Adjust parallel agents based on CPU count or desired parallelism
+        num_agents = min(20, max(1, multiprocessing.cpu_count() // 2))  
+        num_agents = min(num_agents, num_pending) # Don't start more agents than pending configs
+        
+        logging.info(f"Starting execution with {num_agents} parallel processes for {num_pending} pending configs.")
+        
+        # Using a Pool is safer for resource management
+        from multiprocessing import Pool
+        
+        task_args = []
+        for config in pending_configs:
+            task_args.append((config, args, args.env_name, state_dim, action_dim, max_action, args.device, state_file))
+            
+        if num_agents > 0:
+                with Pool(processes=num_agents) as pool:
+                    pool.starmap(run_offline_worker, task_args)
+        else:
+                # Fallback for single process debugging
+                for task in task_args:
+                    run_offline_worker(*task)
+        
+        # 显示最终状态
+        final_summary = state_manager.get_status_summary()
+        logging.info(f"Final search status: {final_summary}")

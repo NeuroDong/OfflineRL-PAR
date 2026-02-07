@@ -175,7 +175,7 @@ def run_toy_experiment():
     
     fig.subplots_adjust(left=0.074, bottom=0.177, right=0.978, top=0.673, wspace=0.077, hspace=0.394)
     fig.set_size_inches(25.6, 14.4)
-    save_path = 'toy_comparison_grid.pdf'
+    save_path = 'imgs/toy_comparison_grid.pdf'
     plt.savefig(save_path)
     plt.show()
     print(f"Saved to {save_path}")
