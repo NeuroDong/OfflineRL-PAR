@@ -30,7 +30,7 @@ Use `main.py` for offline experiments (no network connection required, data save
 - `--algo`: Algorithm selection, options: `["TD3+BC", "EDP", "BCQ", "IQL", "SSAR"]`
 - `--start_synthetic_epoch`: Epoch to start using synthetic data ($T_{start}$ in the paper)
 - `--synthetic_percent_range`: Synthetic data percentage range ([$P_{min}$, $P_{max}$] in the paper), format as a tuple, e.g., `(0., 0.5)`
-- `--LossMultiplier`: Loss multiplier (β in the paper), default value: 1.5
+- `--LossMultiplier`: Loss multiplier ($\beta$ in the paper), default value: 1.5
 
 **Example Command:**
 
